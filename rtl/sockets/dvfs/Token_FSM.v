@@ -24,7 +24,6 @@ module Token_FSM (
 );
 
 
-
     //-------------Input Ports-----------------------------
     input clock, reset, packet_in;  //Add enable input 
     input [31:0] packet_in_val;
