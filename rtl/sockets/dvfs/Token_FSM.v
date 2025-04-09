@@ -21,6 +21,7 @@ module Token_FSM (
     freq_target,  //Output of FSM, to send to LDO
     neighbors_ID,  //From CSR, specifies W/E/N/S neighbors
     PM_network  //From CSR lists which accelerators IDs are part of PM network
+    thermal_overrun,      // NEW: flag from wrapper
 );
 
 
@@ -39,6 +40,7 @@ module Token_FSM (
     input [7:0] token_counter_override;
     input [19:0] neighbors_ID;
     input [31:0] PM_network;
+    input thermal_overrun;    // NEW
     //-------------Output Ports----------------------------
     output packet_out;
     output [31:0] packet_out_val;
@@ -77,6 +79,9 @@ module Token_FSM (
     //parameter COUNT_MIN = 10;
     //parameter COUNT_MAX = 2000; Used for dynamic diming
 
+    parameter COOLDOWN_MAX   = 1000;       // new
+  parameter COOLDOWN_HALF  = COOLDOWN_MAX >> 1; // new
+
     //-------------Internal Variables---------------------------
     reg         [SIZE_COUNT-1:0] refresh_count;
     reg         [SIZE_COUNT-1:0] refresh_count_next;
@@ -96,6 +101,12 @@ module Token_FSM (
     wire signed [          13:0] diva;
     wire signed [          13:0] divb;
     reg         [          31:0] PM_network_shifted_next;
+
+
+ // New cooldown state
+       reg [SIZE_COUNT-1:0] cooldown_cnt, cooldown_cnt_next; //new
+       reg                  cool_off_flag, cool_off_flag_next; //new
+
     wire        [           5:0] max_tokens_act;
     reg                          freeze_div;
     wire signed [           6:0] zerozero;
@@ -143,6 +154,10 @@ module Token_FSM (
             freq_target        <= 0;
             token_counter      <= 0;
             PM_network_shifted <= 0;
+            // reset our new cooldown state
+              cooldown_cnt      <= 0; //new
+              cool_off_flag     <= 0; //new
+
         end else begin
             refresh_count      <= refresh_count_next;
             side_count         <= side_count_next;
@@ -151,6 +166,11 @@ module Token_FSM (
             freq_target        <= freq_target_next;
             token_counter      <= tokens_next;
             PM_network_shifted <= PM_network_shifted_next;
+
+            // register the next cooldown state
+            cooldown_cnt      <= cooldown_cnt_next;//new
+            cool_off_flag     <= cool_off_flag_next;//new
+
         end
     end  // End Of Block OUTPUT_LOGIC
 
@@ -158,6 +178,8 @@ module Token_FSM (
         //Combinational output
 
         //Default
+        cooldown_cnt_next  = cooldown_cnt; //new
+        cool_off_flag_next = cool_off_flag; //new
         side_count_next         = side_count;
         refresh_count_next      = refresh_count + 1;
         refresh_rate_next       = refresh_rate;
@@ -168,6 +190,28 @@ module Token_FSM (
         packet_out_addr         = 0;
         PM_network_shifted_next = PM_network_shifted;
         freeze_div              = 0;
+
+//————————————————————————————————————————————————————————————————————————————————————————————————
+    // THERMAL‐COOLDOWN THROTTLE 
+    if (thermal_overrun && !cool_off_flag) begin
+        // still in first half of cooldown?
+        if (cooldown_cnt < COOLDOWN_HALF) begin
+            cooldown_cnt_next = cooldown_cnt + 1;
+            // release half of your tokens each cycle
+            tokens_next       = token_counter - (max_tokens_act >> 1);
+        end else begin
+            // we’ve done half the cycles → enter full cool‑off
+            cool_off_flag_next = 1;
+        end
+        // skip the rest of the FSM for this cycle
+        disable COMBO;
+    end else if (cool_off_flag) begin
+        // cooldown complete: restore equilibrium
+        tokens_next       = max_tokens_act;
+        disable COMBO;
+    end
+    // ————————————————————————————————————————————————————————————————————————————————————————————————————
+
 
         if (packet_in == 1 && packet_in_val[31] == 0 && enable == 1) begin  //Received update
             tokens_next = token_counter + $signed(packet_in_val[6:0]);
