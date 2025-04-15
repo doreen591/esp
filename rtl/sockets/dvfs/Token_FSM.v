@@ -21,7 +21,8 @@ module Token_FSM (
     freq_target,  //Output of FSM, to send to LDO
     neighbors_ID,  //From CSR, specifies W/E/N/S neighbors
     PM_network  //From CSR lists which accelerators IDs are part of PM network
-    thermal_overrun,      // NEW: flag from wrapper
+ //   thermal_overrun,      // NEW: flag from wrapper
+   
 );
 
 
@@ -72,6 +73,22 @@ module Token_FSM (
     reg signed [6:0] token_counter;
     reg [31:0] PM_network_shifted;
 
+   // -----------Token contributor tracking (ring buffer) ------------------------------------
+    reg [4:0]  coin_src_addr   [3:0];
+    reg [6:0]  coin_src_amount [3:0];
+    reg [1:0]  coin_src_ptr;
+    reg [4:0]  coin_src_addr_next   [3:0];
+    reg [6:0]  coin_src_amount_next [3:0];
+    reg [1:0]  coin_src_ptr_next;
+    reg      valid_src       [3:0];  // Valid flag per contributor
+    reg      valid_src_next  [3:0];
+
+    // Pullback logic
+    reg [3:0] pullback_count, pullback_count_next;
+    reg       pull_triggered, pull_triggered_next;
+    reg [1:0] pullback_index, pullback_index_next;
+    reg       in_pullback_loop, in_pullback_loop_next;
+//------------------------------------------------------------------------------------------
     //-------------Internal Constants--------------------------
     parameter SIZE_COUNT = 11;
     parameter SIDE_COUNT = 5;
@@ -79,8 +96,7 @@ module Token_FSM (
     //parameter COUNT_MIN = 10;
     //parameter COUNT_MAX = 2000; Used for dynamic diming
 
-    parameter COOLDOWN_MAX   = 1000;       // new
-  parameter COOLDOWN_HALF  = COOLDOWN_MAX >> 1; // new
+    parameter [6:0] RATIO_THRESHOLD = 7'd58; // ~90% of 64 max (scaled to 64)
 
     //-------------Internal Variables---------------------------
     reg         [SIZE_COUNT-1:0] refresh_count;
@@ -154,9 +170,21 @@ module Token_FSM (
             freq_target        <= 0;
             token_counter      <= 0;
             PM_network_shifted <= 0;
-            // reset our new cooldown state
-              cooldown_cnt      <= 0; //new
-              cool_off_flag     <= 0; //new
+           
+    //--------------------------------------
+            coin_src_ptr         <= 0;
+            pullback_count       <= 0;
+            pull_triggered       <= 0;
+            pullback_index       <= 0;
+            in_pullback_loop     <= 0;
+            
+            for (i = 0; i < 4; i = i + 1) begin
+                coin_src_addr[i]   <= 0;
+                coin_src_amount[i] <= 0;
+                valid_src[i]       <= 0;
+            end      
+            
+    //------------------------------------        
 
         end else begin
             refresh_count      <= refresh_count_next;
@@ -167,9 +195,19 @@ module Token_FSM (
             token_counter      <= tokens_next;
             PM_network_shifted <= PM_network_shifted_next;
 
-            // register the next cooldown state
-            cooldown_cnt      <= cooldown_cnt_next;//new
-            cool_off_flag     <= cool_off_flag_next;//new
+    //-----------------------------------------------------
+            coin_src_ptr       <= coin_src_ptr_next;
+            pullback_count     <= pullback_count_next;
+            pull_triggered     <= pull_triggered_next;
+            pullback_index     <= pullback_index_next;
+            in_pullback_loop   <= in_pullback_loop_next;
+
+            for (i = 0; i < 4; i = i + 1) begin
+                coin_src_addr[i]   <= coin_src_addr_next[i];
+                coin_src_amount[i] <= coin_src_amount_next[i];
+                valid_src[i]       <= valid_src_next[i];
+            end
+    //------------------------------------------------------        
 
         end
     end  // End Of Block OUTPUT_LOGIC
@@ -192,29 +230,76 @@ module Token_FSM (
         freeze_div              = 0;
 
 //————————————————————————————————————————————————————————————————————————————————————————————————
-    // THERMAL‐COOLDOWN THROTTLE 
-    if (thermal_overrun && !cool_off_flag) begin
-        // still in first half of cooldown?
-        if (cooldown_cnt < COOLDOWN_HALF) begin
-            cooldown_cnt_next = cooldown_cnt + 1;
-            // release half of your tokens each cycle
-            tokens_next       = token_counter - (max_tokens_act >> 1);
-        end else begin
-            // we’ve done half the cycles → enter full cool‑off
-            cool_off_flag_next = 1;
+        pullback_count_next     = pullback_count;
+        pull_triggered_next     = pull_triggered;
+        pullback_index_next     = pullback_index;
+        in_pullback_loop_next   = in_pullback_loop;
+        
+        for (i = 0; i < 4; i = i + 1) begin
+            coin_src_addr_next[i]   = coin_src_addr[i];
+            coin_src_amount_next[i] = coin_src_amount[i];
+            valid_src_next[i]       = valid_src[i];
         end
-        // skip the rest of the FSM for this cycle
-        disable COMBO;
-    end else if (cool_off_flag) begin
-        // cooldown complete: restore equilibrium
-        tokens_next       = max_tokens_act;
-        disable COMBO;
-    end
-    // ————————————————————————————————————————————————————————————————————————————————————————————————————
+        coin_src_ptr_next = coin_src_ptr;
+// ————————————————————————————————————————————————————————————————————————————————————————————————————
+        coin_src_addr_next[coin_src_ptr]   = packet_in_addr;
+        coin_src_amount_next[coin_src_ptr] = packet_in_val[6:0];
+      //  coin_src_ptr_next                  = coin_src_ptr + 1;
+        coin_src_ptr_next                  = (coin_src_ptr + 1) & 2'b11; // Wrap pointer
 
-
-        if (packet_in == 1 && packet_in_val[31] == 0 && enable == 1) begin  //Received update
+       if (packet_in == 1 && packet_in_val[31] == 0 && enable == 1) begin  //Received update
             tokens_next = token_counter + $signed(packet_in_val[6:0]);
+            valid_src_next[coin_src_ptr] = 1;
+//----------------------------------------
+        
+
+            // Pullback trigger logic based on token utilization
+        if (enable && max_tokens != 0 && token_counter[6] == 0) begin
+            if ((token_counter <<< 6) / max_tokens > RATIO_THRESHOLD) begin
+                if (!pull_triggered) begin
+                    pullback_count_next = 5;  // wait 5 cycles
+                    pull_triggered_next = 1;
+                end else if (pullback_count != 0) begin
+                    pullback_count_next = pullback_count - 1;
+                end
+            end else begin
+                pullback_count_next = 0;
+                pull_triggered_next = 0;
+            end
+        end
+       // Pullback Loop: Send Return Tokens
+        if (pull_triggered && pullback_count == 0) begin
+            in_pullback_loop_next = 1;
+            pullback_index_next   = 0;
+            pull_triggered_next   = 0;
+        end
+        
+        if (in_pullback_loop) begin
+            if (valid_src[pullback_index]) begin
+                // (send packet)
+            end
+            if (packet_out_ready && enable && valid_src[pullback_index]) begin
+                packet_out        = 1;
+                packet_out_addr   = coin_src_addr[pullback_index];
+                packet_out_val[31] = 0;  // Data packet
+                packet_out_val[6:0] = ~coin_src_amount[pullback_index] + 1;  // Two’s complement
+                tokens_next       = token_counter - coin_src_amount[pullback_index];
+        
+                if (pullback_index == 3)
+                    in_pullback_loop_next = 0;
+                else
+                    pullback_index_next = pullback_index + 1;
+            end
+                // Clear after use
+                valid_src_next[pullback_index]       = 0;
+                coin_src_amount_next[pullback_index] = 0;
+        end
+            // Skip rest of FSM while returning tokens
+                  disable COMBO;
+            end
+        
+//------------------------------------------            
+
             if (packet_in_val[6:0] == 0) begin
                 if ((refresh_rate + refresh_rate >> 1) <= refresh_rate_max)
                     refresh_rate_next = refresh_rate + refresh_rate >> 1;  //x1.5
